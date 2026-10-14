@@ -14,7 +14,8 @@ from pydantic import BaseModel
 
 app = FastAPI()
 
-ALLOWED_ORIGIN = "https://dash-q3mtxb.example.com"
+# Assignment portal origin
+ALLOWED_ORIGIN = "https://exam.sanand.workers.dev"
 EMAIL = "23f3003555@ds.study.iitm.ac.in"
 
 ISSUER = "https://idp.exam.local"
@@ -30,7 +31,7 @@ SI6iyrYbKR0NEBSqq4XkadEjsCs4F1RncsS4LlgniT7GlkL9Mce3b0wGLs9/7ZIX
 dQIDAQAB
 -----END PUBLIC KEY-----"""
 
-
+# CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[ALLOWED_ORIGIN],
@@ -40,10 +41,12 @@ app.add_middleware(
 )
 
 
+# Request ID and process time middleware
 @app.middleware("http")
 async def add_request_headers(request: Request, call_next):
     start_time = perf_counter()
     request_id = str(uuid4())
+
     try:
         response = await call_next(request)
     except Exception:
@@ -51,6 +54,7 @@ async def add_request_headers(request: Request, call_next):
             status_code=500,
             content={"detail": "Internal Server Error"},
         )
+
     response.headers["X-Request-ID"] = request_id
     response.headers["X-Process-Time"] = (
         f"{max(0.0, perf_counter() - start_time):.6f}"
@@ -58,12 +62,14 @@ async def add_request_headers(request: Request, call_next):
     return response
 
 
+# Stats endpoint
 @app.get("/stats")
 async def get_stats(values: str = Query(...)):
     try:
         parts = values.split(",")
         if any(not part.strip() for part in parts):
             raise ValueError("Empty value")
+
         numbers = [int(part.strip()) for part in parts]
     except ValueError:
         raise HTTPException(
@@ -73,6 +79,7 @@ async def get_stats(values: str = Query(...)):
 
     total = sum(numbers)
     count = len(numbers)
+
     return {
         "email": EMAIL,
         "count": count,
@@ -83,6 +90,7 @@ async def get_stats(values: str = Query(...)):
     }
 
 
+# JWT verification endpoint
 class VerifyRequest(BaseModel):
     token: str
 
@@ -96,14 +104,18 @@ async def verify_token(body: VerifyRequest):
             algorithms=["RS256"],
             issuer=ISSUER,
             audience=AUDIENCE,
-            options={"require": ["exp", "iss", "aud", "email", "sub"]},
+            options={
+                "require": ["exp", "iss", "aud", "email", "sub"]
+            },
         )
+
         return {
             "valid": True,
             "email": claims["email"],
             "sub": claims["sub"],
             "aud": claims["aud"],
         }
+
     except (InvalidTokenError, KeyError, TypeError, ValueError):
         return JSONResponse(
             status_code=401,
@@ -111,6 +123,7 @@ async def verify_token(body: VerifyRequest):
         )
 
 
+# Default configuration
 DEFAULT_CONFIG = {
     "port": 8000,
     "workers": 1,
@@ -127,7 +140,9 @@ def coerce_value(key: str, value):
     if key == "debug":
         if isinstance(value, bool):
             return value
-        return str(value).strip().lower() in ("true", "1", "yes", "on")
+        return str(value).strip().lower() in (
+            "true", "1", "yes", "on"
+        )
 
     if value is None:
         return ""
@@ -135,6 +150,7 @@ def coerce_value(key: str, value):
     return str(value)
 
 
+# Effective configuration endpoint
 @app.get("/effective-config")
 async def effective_config(set: list[str] | None = Query(default=None)):
     config = DEFAULT_CONFIG.copy()
@@ -142,16 +158,23 @@ async def effective_config(set: list[str] | None = Query(default=None)):
     # Layer 2: environment-specific YAML
     environment = os.getenv("APP_ENV", "development")
     yaml_path = f"config.{environment}.yaml"
+
     if os.path.exists(yaml_path):
         with open(yaml_path, "r", encoding="utf-8") as file:
             yaml_config = yaml.safe_load(file) or {}
-        for key, value in yaml_config.items():
-            config[key.lower()] = coerce_value(key.lower(), value)
 
-    # Layer 3: .env file, including NUM_WORKERS alias
+        for key, value in yaml_config.items():
+            key = key.lower()
+            config[key] = coerce_value(key, value)
+
+    # Layer 3: .env file
     env_file = dotenv_values(".env")
-    if "NUM_WORKERS" in env_file and env_file["NUM_WORKERS"] is not None:
-        config["workers"] = coerce_value("workers", env_file["NUM_WORKERS"])
+
+    # NUM_WORKERS alias
+    if env_file.get("NUM_WORKERS") is not None:
+        config["workers"] = coerce_value(
+            "workers", env_file["NUM_WORKERS"]
+        )
 
     env_mapping = {
         "APP_PORT": "port",
@@ -160,30 +183,33 @@ async def effective_config(set: list[str] | None = Query(default=None)):
         "APP_LOG_LEVEL": "log_level",
         "APP_API_KEY": "api_key",
     }
+
     for env_name, config_key in env_mapping.items():
-        if env_name in env_file and env_file[env_name] is not None:
+        if env_file.get(env_name) is not None:
             config[config_key] = coerce_value(
                 config_key, env_file[env_name]
             )
 
-    # Layer 4: actual OS environment variables override .env values
+    # Layer 4: actual OS environment variables
     for env_name, config_key in env_mapping.items():
         if env_name in os.environ:
             config[config_key] = coerce_value(
                 config_key, os.environ[env_name]
             )
 
-    # Layer 5: query-string CLI overrides
+    # Layer 5: query-string overrides
     if set:
         for item in set:
             if "=" not in item:
                 continue
+
             key, value = item.split("=", 1)
             key = key.strip().lower()
+
             if key in config:
                 config[key] = coerce_value(key, value)
 
-    # Never expose the actual secret
+    # Always mask the API key
     config["api_key"] = "****"
-    return config
 
+    return config
