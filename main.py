@@ -1,8 +1,11 @@
 
+import os
 from time import perf_counter
 from uuid import uuid4
 
 import jwt
+import yaml
+from dotenv import dotenv_values
 from jwt.exceptions import InvalidTokenError
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -32,7 +35,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=[ALLOWED_ORIGIN],
     allow_credentials=False,
-    allow_methods=["GET"],
+    allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
 
@@ -41,7 +44,6 @@ app.add_middleware(
 async def add_request_headers(request: Request, call_next):
     start_time = perf_counter()
     request_id = str(uuid4())
-
     try:
         response = await call_next(request)
     except Exception:
@@ -49,7 +51,6 @@ async def add_request_headers(request: Request, call_next):
             status_code=500,
             content={"detail": "Internal Server Error"},
         )
-
     response.headers["X-Request-ID"] = request_id
     response.headers["X-Process-Time"] = (
         f"{max(0.0, perf_counter() - start_time):.6f}"
@@ -72,7 +73,6 @@ async def get_stats(values: str = Query(...)):
 
     total = sum(numbers)
     count = len(numbers)
-
     return {
         "email": EMAIL,
         "count": count,
@@ -98,17 +98,92 @@ async def verify_token(body: VerifyRequest):
             audience=AUDIENCE,
             options={"require": ["exp", "iss", "aud", "email", "sub"]},
         )
-
         return {
             "valid": True,
             "email": claims["email"],
             "sub": claims["sub"],
             "aud": claims["aud"],
         }
-
     except (InvalidTokenError, KeyError, TypeError, ValueError):
         return JSONResponse(
             status_code=401,
             content={"valid": False},
         )
+
+
+DEFAULT_CONFIG = {
+    "port": 8000,
+    "workers": 1,
+    "debug": False,
+    "log_level": "info",
+    "api_key": "default-secret-000",
+}
+
+
+def coerce_value(key: str, value):
+    if key in ("port", "workers"):
+        return int(value)
+
+    if key == "debug":
+        if isinstance(value, bool):
+            return value
+        return str(value).strip().lower() in ("true", "1", "yes", "on")
+
+    if value is None:
+        return ""
+
+    return str(value)
+
+
+@app.get("/effective-config")
+async def effective_config(set: list[str] | None = Query(default=None)):
+    config = DEFAULT_CONFIG.copy()
+
+    # Layer 2: environment-specific YAML
+    environment = os.getenv("APP_ENV", "development")
+    yaml_path = f"config.{environment}.yaml"
+    if os.path.exists(yaml_path):
+        with open(yaml_path, "r", encoding="utf-8") as file:
+            yaml_config = yaml.safe_load(file) or {}
+        for key, value in yaml_config.items():
+            config[key.lower()] = coerce_value(key.lower(), value)
+
+    # Layer 3: .env file, including NUM_WORKERS alias
+    env_file = dotenv_values(".env")
+    if "NUM_WORKERS" in env_file and env_file["NUM_WORKERS"] is not None:
+        config["workers"] = coerce_value("workers", env_file["NUM_WORKERS"])
+
+    env_mapping = {
+        "APP_PORT": "port",
+        "APP_WORKERS": "workers",
+        "APP_DEBUG": "debug",
+        "APP_LOG_LEVEL": "log_level",
+        "APP_API_KEY": "api_key",
+    }
+    for env_name, config_key in env_mapping.items():
+        if env_name in env_file and env_file[env_name] is not None:
+            config[config_key] = coerce_value(
+                config_key, env_file[env_name]
+            )
+
+    # Layer 4: actual OS environment variables override .env values
+    for env_name, config_key in env_mapping.items():
+        if env_name in os.environ:
+            config[config_key] = coerce_value(
+                config_key, os.environ[env_name]
+            )
+
+    # Layer 5: query-string CLI overrides
+    if set:
+        for item in set:
+            if "=" not in item:
+                continue
+            key, value = item.split("=", 1)
+            key = key.strip().lower()
+            if key in config:
+                config[key] = coerce_value(key, value)
+
+    # Never expose the actual secret
+    config["api_key"] = "****"
+    return config
 
